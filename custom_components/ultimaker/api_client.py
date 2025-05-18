@@ -60,6 +60,8 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
         self._url_system = LOCAL_API_URL.format(host) + "/system"
         self._url_materials = LOCAL_API_URL.format(host) + "/materials"
         self._material_names_cache = {}  # Cache for material names
+        self._is_printer_offline = False  # Track if printer is offline
+        self._last_online_check = datetime.now()  # Track when we last checked if printer is online
         _LOGGER.debug("Local API URLs configured: printer=%s, print_job=%s, system=%s, materials=%s", 
                      self._url_printer, self._url_print_job, self._url_system, self._url_materials)
         _LOGGER.info("UltimakerLocalApiClient initialized successfully")
@@ -90,7 +92,7 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
 
             material_xml = await self._fetch_data(material_url)
             if not material_xml or not isinstance(material_xml, str):
-                _LOGGER.warning("Failed to fetch material data for GUID %s", material_guid)
+                _LOGGER.debug("Failed to fetch material data for GUID %s", material_guid)
                 return material_guid
 
             # Parse the XML to extract the material name
@@ -125,7 +127,7 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
                     return material_name
 
             except ET.ParseError:
-                _LOGGER.warning("Failed to parse material XML for GUID %s", material_guid)
+                _LOGGER.debug("Failed to parse material XML for GUID %s", material_guid)
 
                 # Try to extract the name using regex as a fallback
                 match = re.search(r"<name>(.*?)</name>", material_xml)
@@ -139,7 +141,7 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
                     return material_name
 
             # If all else fails, return the GUID
-            _LOGGER.warning("Could not extract material name from XML for GUID %s", material_guid)
+            _LOGGER.debug("Could not extract material name from XML for GUID %s", material_guid)
             return material_guid
 
         except Exception as err:
@@ -155,15 +157,36 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
             _LOGGER.error("No host configured for Ultimaker printer")
             raise UpdateFailed("No host configured")
 
+        # Check if we need to do a connectivity check or full data fetch
+        current_time = datetime.now()
+        time_since_last_check = (current_time - self._last_online_check).total_seconds()
+
+        # If printer was offline, only check connectivity every 10 seconds
+        if self._is_printer_offline and time_since_last_check < 10:
+            _LOGGER.debug("Printer was offline, skipping detailed data fetch until next connectivity check")
+            # Return the existing data (which should have status: "not connected")
+            if self._data and "status" in self._data:
+                return self._data
+            else:
+                # If we don't have any data yet, create a basic offline data structure
+                self._data = {"status": "not connected"}
+                return self._data
+
+        # Update the last online check time
+        self._last_online_check = current_time
+
         try:
-            # Fetch printer data - this contains all the information we need
-            _LOGGER.debug("Fetching printer data from %s", self._url_printer)
+            # First, do a quick connectivity check
+            _LOGGER.debug("Checking connectivity to printer at %s", self._host)
             printer_data = await self._fetch_data(self._url_printer)
 
             if not printer_data:
-                _LOGGER.debug("Failed to fetch printer data from %s (printer may be offline)", self._url_printer)
+                _LOGGER.debug("Failed to fetch printer data from %s (printer is offline)", self._url_printer)
                 self._consecutive_errors += 1
                 _LOGGER.debug("Consecutive errors: %d/%d", self._consecutive_errors, self._max_consecutive_errors)
+
+                # Mark the printer as offline
+                self._is_printer_offline = True
 
                 # If we have previous successful data and haven't exceeded max consecutive errors,
                 # use the cached data instead of failing
@@ -180,6 +203,11 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
                     raise UpdateFailed("Failed to fetch printer data")
 
             _LOGGER.debug("Received printer data: %s", printer_data)
+
+            # If printer was previously offline, log that it's back online
+            if self._is_printer_offline:
+                _LOGGER.info("Fetching Ultimaker (%s) data recovered", self._host)
+                self._is_printer_offline = False
 
             # Use the printer data directly
             self._data = printer_data
@@ -395,7 +423,8 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
                     if extruders and len(extruders) > 0:
                         extruder = extruders[0]
                         active_material = extruder.get("active_material", {})
-                        material_guid = active_material.get("GUID", "unknown")
+                        # Try both uppercase and lowercase GUID keys
+                        material_guid = active_material.get("GUID", active_material.get("guid", "unknown"))
 
                         if material_guid and material_guid != "unknown":
                             _LOGGER.debug("Fetching material name for hotend 1 material GUID: %s", material_guid)
@@ -409,7 +438,8 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
                     if extruders and len(extruders) > 1:
                         extruder2 = extruders[1]
                         active_material2 = extruder2.get("active_material", {})
-                        material_guid2 = active_material2.get("GUID", "unknown")
+                        # Try both uppercase and lowercase GUID keys
+                        material_guid2 = active_material2.get("GUID", active_material2.get("guid", "unknown"))
 
                         if material_guid2 and material_guid2 != "unknown":
                             _LOGGER.debug("Fetching material name for hotend 2 material GUID: %s", material_guid2)
@@ -430,6 +460,10 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
             _LOGGER.debug("Connection error fetching data from Ultimaker printer at %s: %s (printer may be offline)", self._host, err)
             self._consecutive_errors += 1
             _LOGGER.debug("Consecutive errors: %d/%d", self._consecutive_errors, self._max_consecutive_errors)
+
+            # Mark the printer as offline
+            self._is_printer_offline = True
+            _LOGGER.error("Error fetching Ultimaker (%s) data: Connection error: %s", self._host, err)
 
             # If we have previous successful data and haven't exceeded max consecutive errors,
             # use the cached data instead of failing
@@ -454,6 +488,10 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
             _LOGGER.debug("Timeout error fetching data from Ultimaker printer at %s (printer may be offline)", self._host)
             self._consecutive_errors += 1
             _LOGGER.debug("Consecutive errors: %d/%d", self._consecutive_errors, self._max_consecutive_errors)
+
+            # Mark the printer as offline
+            self._is_printer_offline = True
+            _LOGGER.error("Error fetching Ultimaker (%s) data: Connection timeout", self._host)
 
             # If we have previous successful data and haven't exceeded max consecutive errors,
             # use the cached data instead of failing
@@ -480,6 +518,10 @@ class UltimakerLocalApiClient(UltimakerApiClientBase):
             _LOGGER.error("Unknown error fetching data from Ultimaker printer at %s: %s", self._host, err)
             self._consecutive_errors += 1
             _LOGGER.debug("Consecutive errors: %d/%d", self._consecutive_errors, self._max_consecutive_errors)
+
+            # Mark the printer as offline
+            self._is_printer_offline = True
+            _LOGGER.error("Error fetching Ultimaker (%s) data: Unknown error: %s", self._host, err)
 
             # If we have previous successful data and haven't exceeded max consecutive errors,
             # use the cached data instead of failing
